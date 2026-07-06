@@ -104,7 +104,7 @@ def main():
     if not OIDC_CLIENT_ID or not OIDC_CLIENT_SECRET:
         logger.warning("OIDC_CLIENT_ID and/or OIDC_CLIENT_SECRET are missing. Secure endpoints may fail.")
     
-    mcp.run(transport="http", host="0.0.0.0", port=3000)
+    mcp.run(transport="http", host="0.0.0.0", port=3000, path="/")
 
 if __name__ == "__main__":
     main()
