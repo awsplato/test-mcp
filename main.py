@@ -1,12 +1,10 @@
 import os
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional
 from fastmcp import FastMCP
 import httpx
-from pydantic import BaseModel
 from dotenv import load_dotenv
-from fastmcp.server.auth import OAuthProxy
-from fastmcp.server.auth.providers.jwt import JWTVerifier
+from fastmcp.server.auth.providers.keycloak import KeycloakAuthProvider
 from fastmcp.server.dependencies import get_access_token
 
 # Load environment variables
@@ -16,95 +14,75 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ittwist-mcp")
 
-# Enterprise OIDC settings
-OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID")
-OIDC_CLIENT_SECRET = os.getenv("OIDC_CLIENT_SECRET")
-# For Keycloak, this looks like: https://<domain>/realms/<realm>/protocol/openid-connect/token
-OIDC_TOKEN_URL = os.getenv("OIDC_TOKEN_URL", "http://localhost:8080/realms/master/protocol/openid-connect/token")
-
-# Keycloak OAuthProxy Configuration (No DCR required)
+# Keycloak + FastMCP configuration
+# Requires Keycloak 26.6.0+ with Dynamic Client Registration (DCR) enabled on the realm
 KEYCLOAK_REALM_URL = os.getenv("KEYCLOAK_REALM_URL", "http://localhost:8080/realms/master")
 FASTMCP_BASE_URL = os.getenv("FASTMCP_BASE_URL", "http://localhost:3000")
 
-jwt_verifier = JWTVerifier(
-    jwks_uri=f"{KEYCLOAK_REALM_URL}/protocol/openid-connect/certs",
-    # Set audience if your tokens are issued with a specific audience
-    audience=os.getenv("OIDC_AUDIENCE")
-)
+# Optional: restrict required OAuth scopes
+REQUIRED_SCOPES: list[str] = [s for s in os.getenv("REQUIRED_SCOPES", "").split(",") if s]
 
-auth_provider = OAuthProxy(
-    upstream_authorization_endpoint=f"{KEYCLOAK_REALM_URL}/protocol/openid-connect/auth",
-    upstream_token_endpoint=f"{KEYCLOAK_REALM_URL}/protocol/openid-connect/token",
-    upstream_client_id=OIDC_CLIENT_ID or "",
-    upstream_client_secret=OIDC_CLIENT_SECRET,
+# Optional: audience for production — tokens must be intended for this server.
+# Set OIDC_AUDIENCE in .env (e.g. to FASTMCP_BASE_URL) to harden production.
+OIDC_AUDIENCE: Optional[str] = os.getenv("OIDC_AUDIENCE") or None
+
+# ---------------------------------------------------------------------------
+# Auth: RemoteAuthProvider backed by Keycloak with native DCR support.
+# MCP clients self-register via RFC 7591 Dynamic Client Registration —
+# no upstream_client_id / upstream_client_secret needed anymore.
+# ---------------------------------------------------------------------------
+auth_provider = KeycloakAuthProvider(
+    realm_url=KEYCLOAK_REALM_URL,
     base_url=FASTMCP_BASE_URL,
-    token_verifier=jwt_verifier
+    # audience=OIDC_AUDIENCE,  # Uncomment and set OIDC_AUDIENCE for production
+    required_scopes=REQUIRED_SCOPES if REQUIRED_SCOPES else None,
 )
 
-class OIDCClient:
-    """Enterprise OIDC Client for fetching OAuth tokens via Client Credentials flow."""
-    def __init__(self, client_id: str, client_secret: str, token_url: str):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.token_url = token_url
-        self._token: Optional[str] = None
-    
-    async def get_token(self) -> str:
-        """Fetch or return a cached OIDC token."""
-        # In a real enterprise app, you'd cache the token and check expiration
-        if self._token:
-            return self._token
-            
-        if not self.client_id or not self.client_secret:
-            logger.warning("OIDC credentials not fully configured.")
-            return ""
-            
-        async with httpx.AsyncClient() as client:
-            try:
-                logger.info(f"Fetching OIDC token from {self.token_url}")
-                # Keycloak and compliant OIDC providers prefer Basic Auth for client credentials
-                response = await client.post(
-                    self.token_url,
-                    auth=(self.client_id, self.client_secret),
-                    data={
-                        "grant_type": "client_credentials"
-                    }
-                )
-                response.raise_for_status()
-                data = response.json()
-                self._token = data.get("access_token", "")
-                return self._token
-            except Exception as e:
-                logger.error(f"Failed to fetch OIDC token: {e}")
-                raise
-
-# Initialize OIDC client singleton
-oidc_client = OIDCClient(
-    client_id=OIDC_CLIENT_ID or "",
-    client_secret=OIDC_CLIENT_SECRET or "",
-    token_url=OIDC_TOKEN_URL
-)
-
-# Initialize Enterprise FastMCP Server with Native Authentication
+# ---------------------------------------------------------------------------
+# FastMCP server
+# ---------------------------------------------------------------------------
 mcp = FastMCP("ittwist-mcp", auth=auth_provider)
+
 
 @mcp.tool()
 def add_numbers(a: float, b: float) -> float:
     """
     Adds two numbers together.
-    
+
     Args:
         a: The first number.
         b: The second number.
     """
     return a + b
 
+
+@mcp.tool()
+async def whoami() -> dict:
+    """
+    Returns basic claims from the authenticated user's Keycloak JWT.
+    Useful for verifying that DCR + token validation is working end-to-end.
+    """
+    token = get_access_token()
+    if token is None:
+        return {"error": "Not authenticated"}
+    return {
+        "sub": token.claims.get("sub"),
+        "preferred_username": token.claims.get("preferred_username"),
+        "scope": token.claims.get("scope"),
+        "azp": token.claims.get("azp"),  # Authorized party (the DCR client_id)
+        "realm_roles": token.claims.get("realm_access", {}).get("roles", []),
+    }
+
+
 def main():
-    logger.info("Starting Enterprise FastMCP Server with OIDC support...")
-    if not OIDC_CLIENT_ID or not OIDC_CLIENT_SECRET:
-        logger.warning("OIDC_CLIENT_ID and/or OIDC_CLIENT_SECRET are missing. Secure endpoints may fail.")
-    
+    logger.info("Starting ittwist-mcp with Keycloak DCR (RemoteAuthProvider)...")
+    logger.info(f"  Realm URL : {KEYCLOAK_REALM_URL}")
+    logger.info(f"  Base URL  : {FASTMCP_BASE_URL}")
+    logger.info(f"  Scopes    : {REQUIRED_SCOPES or 'any'}")
+    logger.info(f"  Audience  : {OIDC_AUDIENCE or 'not enforced (set OIDC_AUDIENCE for production)'}")
+
     mcp.run(transport="http", host="0.0.0.0", port=3000, path="/")
+
 
 if __name__ == "__main__":
     main()
